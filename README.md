@@ -37,7 +37,7 @@ The output is saved in `results/` by default.
 ## Requirements
 
 - [Go 1.23 or later](https://go.dev/dl/) for running from source.
-- Windows 11, macOS, or Linux.
+- Windows, macOS, Linux, or FreeBSD.
 - Network access to public source lists and the testing APIs.
 
 ## Quick start (Windows / PowerShell)
