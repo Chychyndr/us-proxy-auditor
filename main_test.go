@@ -2,11 +2,18 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/csv"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -244,5 +251,122 @@ func TestNoFeedsInputOnly(t *testing.T) {
 	}
 	if len(proxies) != 1 || !strings.Contains(proxies[0].url(), "8.8.8.8") {
 		t.Fatal(proxies)
+	}
+}
+
+// TestSOCKS5Transport verifies the standard-library SOCKS5 tunnel offline.
+func TestSOCKS5Transport(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("proxy-ok")) }))
+	defer upstream.Close()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	done := make(chan error, 1)
+	go func() {
+		c, err := listener.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer c.Close()
+		head := make([]byte, 2)
+		if _, err = io.ReadFull(c, head); err != nil {
+			done <- err
+			return
+		}
+		methods := make([]byte, int(head[1]))
+		if _, err = io.ReadFull(c, methods); err != nil {
+			done <- err
+			return
+		}
+		if _, err = c.Write([]byte{5, 0}); err != nil {
+			done <- err
+			return
+		}
+		req := make([]byte, 4)
+		if _, err = io.ReadFull(c, req); err != nil {
+			done <- err
+			return
+		}
+		var host string
+		switch req[3] {
+		case 1:
+			addr := make([]byte, 4)
+			if _, err = io.ReadFull(c, addr); err != nil {
+				done <- err
+				return
+			}
+			host = net.IP(addr).String()
+		case 3:
+			lenBytes := make([]byte, 1)
+			if _, err = io.ReadFull(c, lenBytes); err != nil {
+				done <- err
+				return
+			}
+			addr := make([]byte, int(lenBytes[0]))
+			if _, err = io.ReadFull(c, addr); err != nil {
+				done <- err
+				return
+			}
+			host = string(addr)
+		default:
+			done <- fmt.Errorf("unexpected SOCKS address type: %d", req[3])
+			return
+		}
+		portBytes := make([]byte, 2)
+		if _, err = io.ReadFull(c, portBytes); err != nil {
+			done <- err
+			return
+		}
+		remote, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(int(binary.BigEndian.Uint16(portBytes)))), time.Second)
+		if err != nil {
+			done <- err
+			return
+		}
+		defer remote.Close()
+		if _, err = c.Write([]byte{5, 0, 0, 1, 127, 0, 0, 1, 0, 0}); err != nil {
+			done <- err
+			return
+		}
+		go io.Copy(remote, c)
+		_, err = io.Copy(c, remote)
+		done <- err
+	}()
+	host, portStr, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := proxyClient(&proxy{Scheme: "socks5", Host: host, Port: port}, 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeClient(client)
+	r, err := client.Get(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "proxy-ok" {
+		t.Fatalf("unexpected body: %q", body)
+	}
+}
+
+func TestTLSCertificateVerification(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer server.Close()
+	client := newDirectClient(2 * time.Second)
+	defer closeClient(client)
+	if _, err := client.Get(server.URL); err == nil {
+		t.Fatal("accepted an untrusted TLS certificate")
 	}
 }
