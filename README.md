@@ -79,6 +79,40 @@ go run . --no-feeds --input .\my_proxies.txt --input-protocol socks5
 
 Each local list entry may be `IP:PORT`, `http://IP:PORT`, or `socks5://IP:PORT`. Authenticated proxies and IPv6 endpoint literals are not supported.
 
+## Verification history
+
+Each completed scan appends a record for every checked proxy to `results/history.jsonl`. The file preserves UTC check timestamps, success/failure status, exit IP, latency, jitter, quality score, and failure reason. It is retained across runs; the current CSV/TXT files are updated with the latest scan.
+
+```powershell
+# Choose a different history file
+go run . --history-file .\my-history.jsonl
+
+# Scan without reading or writing history
+go run . --no-history
+```
+
+The CSV files contain `quality_score`, `history_checks`, `history_passed`, and `history_pass_rate_pct`. If a history file is invalid, the scan reports an error instead of silently replacing the existing data. To start a fresh history, move or rename the JSONL file.
+
+## Automatic rechecks
+
+Use watch mode to periodically recheck **all proxies that passed the initial scan**, including those temporarily failing a subsequent check. It does not redownload source lists until you start a new scan. Press **Ctrl+C** to stop.
+
+```powershell
+# Recheck the initial verified set every 15 minutes until stopped
+go run . --watch-interval 15m --check-google --check-headers
+
+# Run exactly 3 scans in total (initial scan + 2 rechecks)
+go run . --watch-interval 5m --watch-cycles 3 --limit 2000
+```
+
+The interval begins after the previous scan finishes and must be at least 30 seconds. The latest verified lists and CSV reports are overwritten each cycle; history remains append-only. Watch mode stops if no proxies pass the initial scan.
+
+## Quality score
+
+Each successfully verified proxy receives a score from **0 to 100**, based on measured HTTPS latency (up to 45 points), variation in response times (up to 20 points), and its verified pass rate across current and earlier scans (up to 35 points). Failed proxies receive 0 points. Verified results are ranked by the score; the prior ISP/hosting and source-count heuristics are tie-breakers.
+
+Scores describe observed connection performance and stability only. They cannot measure IP reputation, residential authenticity, anonymity, or the ability to pass anti-bot protections.
+
 ## Key options
 
 | Flag | Default | Purpose |
@@ -95,6 +129,10 @@ Each local list entry may be `IP:PORT`, `http://IP:PORT`, or `socks5://IP:PORT`.
 | `--input` | None | Read additional local proxy candidates |
 | `--no-feeds` | Off | Skip online lists and check only local input |
 | `--output` | `results` | Output directory |
+| `--history-file` | `OUTPUT/history.jsonl` | Override append-only history path |
+| `--no-history` | Off | Disable persistence, use only current scan for score |
+| `--watch-interval` | Off | Recheck initial verified proxies periodically (minimum 30s) |
+| `--watch-cycles` | `0` | Total scans including first; 0 means unlimited while watching |
 
 The **Windows launcher enables strict checks** by default. The raw command without additional flags skips the optional Google and forwarding-header tests.
 
@@ -122,6 +160,7 @@ The US geographic tag describes two providers' IP location reports. The provider
 | `results/verified_us.csv` | Detailed metrics for passing proxies |
 | `results/all_results.csv` | Every candidate, including rejection reasons |
 | `results/report.json` | Metadata, durations, status counts, and source failures |
+| `results/history.jsonl` | Append-only per-proxy check history from all runs |
 
 **Fury:** Enter the endpoint protocol, host, and port in the profile's Proxy settings. Avoid pasting the full proxy URL into the Host field.
 
@@ -144,4 +183,4 @@ go test -race ./...  # if the Go race detector is supported on your system
 go build .
 ```
 
-The tests are offline and validate parsing, safe input filtering, deduplication, multi-stage decisions, classification, concurrency bounds, and report generation. Live proxy availability, ISP classification, anti-bot acceptance, and physical location cannot be guaranteed by unit tests. Only test public endpoints you are authorized to use; obey source-provider terms and API rate limits.
+The tests are offline and validate parsing, safe input filtering, deduplication, multi-stage decisions, classification, concurrency bounds, persistent history, quality scoring, watch candidate selection, and report generation. Live proxy availability, ISP classification, anti-bot acceptance, and physical location cannot be guaranteed by unit tests. Only test public endpoints you are authorized to use; obey source-provider terms and API rate limits.
