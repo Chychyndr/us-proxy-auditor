@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -22,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -83,6 +85,10 @@ type result struct {
 	GoogleStatus string
 	HeadersLeak  string
 	Failure      string
+	QualityScore  int
+	HistoryChecks int
+	HistoryPassed int
+	HistoryPassRate float64
 }
 
 type options struct {
@@ -99,11 +105,17 @@ type options struct {
 	CheckHeaders   bool
 	ExcludeHosting bool
 	NoFeeds        bool
+	NoHistory      bool
+	HistoryFile    string
+	WatchInterval  time.Duration
+	WatchCycles    int
+	WatchProxies   []*proxy
 }
 
 func flags() options {
 	var o options
 	var timeout float64
+	var watchInterval string
 	flag.IntVar(&o.Limit, "limit", 1500, "maximum proxy candidates to scan (1-10000)")
 	flag.IntVar(&o.Concurrency, "concurrency", 128, "parallel proxy checks (1-256)")
 	flag.Float64Var(&timeout, "timeout", 5, "per-request timeout in seconds (2-30)")
@@ -117,7 +129,23 @@ func flags() options {
 	flag.BoolVar(&o.CheckHeaders, "check-headers", false, "reject proxies exposing Forwarded/Via headers")
 	flag.BoolVar(&o.ExcludeHosting, "exclude-hosting", false, "exclude likely datacenter networks (heuristic)")
 	flag.BoolVar(&o.NoFeeds, "no-feeds", false, "use only --input; do not download public lists")
+	flag.BoolVar(&o.NoHistory, "no-history", false, "disable history persistence (quality scores use only the current check)")
+	flag.StringVar(&o.HistoryFile, "history-file", "", "custom JSONL history file (default: OUTPUT/history.jsonl)")
+	flag.StringVar(&watchInterval, "watch-interval", "", "periodically recheck all initially verified proxies (example: 15m)")
+	flag.IntVar(&o.WatchCycles, "watch-cycles", 0, "total scans in watch mode including the first (0 = unlimited)")
 	flag.Parse()
+	if watchInterval != "" {
+		interval, err := time.ParseDuration(watchInterval)
+		if err != nil || interval < 30*time.Second {
+			fmt.Fprintln(os.Stderr, "--watch-interval must be at least 30s (example: 15m)")
+			os.Exit(2)
+		}
+		o.WatchInterval = interval
+	}
+	if o.WatchCycles < 0 || (o.WatchCycles != 0 && o.WatchInterval == 0) {
+		fmt.Fprintln(os.Stderr, "--watch-cycles requires --watch-interval and must be nonnegative")
+		os.Exit(2)
+	}
 	if o.Limit < 1 || o.Limit > 10000 || o.Concurrency < 1 || o.Concurrency > 256 || timeout < 2 || timeout > 30 || o.Rounds < 3 || o.Rounds > 8 || o.GeoCap < 1 || o.GeoCap > 500 || o.GeoRate < 1 || o.GeoRate > 5 || !slices.Contains([]string{"socks5", "http"}, o.InputProtocol) || (o.NoFeeds && o.Input == "") {
 		fmt.Fprintln(os.Stderr, "Invalid settings. Run with --help to inspect parameter limits.")
 		os.Exit(2)
@@ -622,6 +650,9 @@ func sortedVerified(rs []*result) []*result {
 				return 2
 			}
 		}
+		if a.QualityScore != b.QualityScore {
+			return a.QualityScore > b.QualityScore
+		}
 		if tier(a.NetworkType) != tier(b.NetworkType) {
 			return tier(a.NetworkType) < tier(b.NetworkType)
 		}
@@ -636,7 +667,7 @@ func sortedVerified(rs []*result) []*result {
 	return verified
 }
 
-var fields = []string{"status", "protocol", "host", "port", "proxy_url", "exit_ip", "country_1", "country_2", "organization", "network_type_hint", "latency_ms", "jitter_ms", "successes", "attempts", "google_http_status", "headers_leak", "sources_count", "sources", "failure"}
+var fields = []string{"status", "protocol", "host", "port", "proxy_url", "exit_ip", "country_1", "country_2", "organization", "network_type_hint", "latency_ms", "jitter_ms", "successes", "attempts", "google_http_status", "headers_leak", "sources_count", "sources", "failure", "quality_score", "history_checks", "history_passed", "history_pass_rate_pct"}
 
 func csvRecord(r *result) []string {
 	names := make([]string, 0, len(r.Proxy.Sources))
@@ -644,7 +675,7 @@ func csvRecord(r *result) []string {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	return []string{r.Status, r.Proxy.Scheme, r.Proxy.Host, strconv.Itoa(r.Proxy.Port), r.Proxy.url(), r.ExitIP, r.Country1, r.Country2, r.Organization, r.NetworkType, strconv.FormatInt(r.LatencyMS, 10), strconv.FormatInt(r.JitterMS, 10), strconv.Itoa(r.Successes), strconv.Itoa(r.Attempts), r.GoogleStatus, r.HeadersLeak, strconv.Itoa(len(names)), strings.Join(names, "; "), r.Failure}
+	return []string{r.Status, r.Proxy.Scheme, r.Proxy.Host, strconv.Itoa(r.Proxy.Port), r.Proxy.url(), r.ExitIP, r.Country1, r.Country2, r.Organization, r.NetworkType, strconv.FormatInt(r.LatencyMS, 10), strconv.FormatInt(r.JitterMS, 10), strconv.Itoa(r.Successes), strconv.Itoa(r.Attempts), r.GoogleStatus, r.HeadersLeak, strconv.Itoa(len(names)), strings.Join(names, "; "), r.Failure, strconv.Itoa(r.QualityScore), strconv.Itoa(r.HistoryChecks), strconv.Itoa(r.HistoryPassed), fmt.Sprintf("%.1f", r.HistoryPassRate)}
 }
 func writeCSV(path string, results []*result) error {
 	f, err := os.Create(path)
@@ -712,7 +743,7 @@ func writeReports(results []*result, sourceInfo map[string]feedReport, o options
 	report := map[string]any{
 		"created_at_utc": time.Now().UTC().Format(time.RFC3339), "duration_seconds": seconds,
 		"checked_candidates": len(results), "verified_us": len(verified), "status_counts": counts, "sources": sourceInfo,
-		"settings": map[string]any{"limit": o.Limit, "concurrency": o.Concurrency, "timeout_seconds": o.Timeout.Seconds(), "rounds": o.Rounds, "geo_cap": o.GeoCap, "geo_rate": o.GeoRate, "check_google": o.CheckGoogle, "check_headers": o.CheckHeaders, "exclude_hosting": o.ExcludeHosting},
+		"settings": map[string]any{"limit": o.Limit, "concurrency": o.Concurrency, "timeout_seconds": o.Timeout.Seconds(), "rounds": o.Rounds, "geo_cap": o.GeoCap, "geo_rate": o.GeoRate, "check_google": o.CheckGoogle, "check_headers": o.CheckHeaders, "exclude_hosting": o.ExcludeHosting, "history_enabled": !o.NoHistory, "watch_interval": o.WatchInterval.String(), "watch_cycles": o.WatchCycles},
 		"caveats":  []string{"Public proxies are untrusted. Never transmit credentials through them.", "Geo location requires agreement from two providers; it is not a physical-location guarantee.", "Network-type classification is heuristic, and appearances in lists do not establish real-world popularity.", "Website bot checks, WebRTC leakage, and browser fingerprints are outside this tool's scope."},
 	}
 	b, err := json.MarshalIndent(report, "", "  ")
@@ -722,15 +753,24 @@ func writeReports(results []*result, sourceInfo map[string]feedReport, o options
 	return os.WriteFile(filepath.Join(o.Output, "report.json"), append(b, '\n'), 0644)
 }
 
-func run(ctx context.Context, o options) error {
+func run(ctx context.Context, o options) ([]*result, error) {
 	started := time.Now()
-	fmt.Println("[1/4] Collecting public proxy lists...")
-	proxies, sourceInfo, err := fetchSources(ctx, o)
-	if err != nil {
-		return err
+	var proxies []*proxy
+	sourceInfo := make(map[string]feedReport)
+	if o.WatchProxies != nil {
+		proxies = o.WatchProxies
+		fmt.Printf("[1/4] Rechecking %d retained proxy candidates...\n", len(proxies))
+		sourceInfo["watch_recheck"] = feedReport{Candidates: len(proxies)}
+	} else {
+		fmt.Println("[1/4] Collecting public proxy lists...")
+		var err error
+		proxies, sourceInfo, err = fetchSources(ctx, o)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if len(proxies) == 0 {
-		return errors.New("no proxy candidates found; try --input or check source availability")
+		return nil, errors.New("no proxy candidates found; try --input or check source availability")
 	}
 	fmt.Printf("Unique candidates to test: %d\n", len(proxies))
 	directClient := newDirectClient(o.Timeout)
@@ -756,6 +796,9 @@ func run(ctx context.Context, o options) error {
 			fmt.Printf("  Checked %d/%d\n", n, len(indexes))
 		}
 	})
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	candidates := make([]*result, 0)
 	for _, r := range results {
 		if r.Status == "pending_geo" {
@@ -795,6 +838,9 @@ func run(ctx context.Context, o options) error {
 	})
 	permits.Stop()
 	closeClient(geoClient)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	eligible := make([]*result, 0)
 	for _, r := range candidates {
 		if g, ok := geos[r.ExitIP]; ok {
@@ -818,9 +864,15 @@ func run(ctx context.Context, o options) error {
 			fmt.Printf("  Rechecked %d/%d\n", n, len(eligible))
 		}
 	})
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	elapsed := time.Since(started).Seconds()
+	if err := applyHistory(results, o); err != nil {
+		return nil, err
+	}
 	if err := writeReports(results, sourceInfo, o, elapsed); err != nil {
-		return err
+		return nil, err
 	}
 	verified := sortedVerified(results)
 	fmt.Printf("\nCompleted in %.1fs: %d candidates, %d strictly verified US proxies.\n", elapsed, len(results), len(verified))
@@ -828,17 +880,57 @@ func run(ctx context.Context, o options) error {
 		if i >= 10 {
 			break
 		}
-		fmt.Printf("  %-34s %5d ms | %-17s | %.48s\n", r.Proxy.url(), r.LatencyMS, r.NetworkType, r.Organization)
+		fmt.Printf("  %-34s score %3d | %5d ms | %-17s | %.40s\n", r.Proxy.url(), r.QualityScore, r.LatencyMS, r.NetworkType, r.Organization)
 	}
 	absolute, _ := filepath.Abs(o.Output)
 	fmt.Println("Results:", absolute)
-	return nil
+	return results, nil
 }
 
 func main() {
 	o := flags()
-	if err := run(context.Background(), o); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	results, err := run(ctx, o)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			fmt.Println("\nScan interrupted.")
+			return
+		}
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
+	}
+	if o.WatchInterval <= 0 || o.WatchCycles == 1 {
+		return
+	}
+	candidates := watchCandidates(results)
+	if len(candidates) == 0 {
+		fmt.Println("Watch mode stopped: no strictly verified US proxies from the initial scan.")
+		return
+	}
+	fmt.Printf("Watch mode enabled: retaining %d proxies; rechecking every %s. Press Ctrl+C to stop.\n", len(candidates), o.WatchInterval)
+	for cycle := 2; o.WatchCycles == 0 || cycle <= o.WatchCycles; cycle++ {
+		timer := time.NewTimer(o.WatchInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			fmt.Println("\nWatch mode stopped.")
+			return
+		case <-timer.C:
+		}
+		fmt.Printf("\n[watch] Starting scan %d...\n", cycle)
+		next := o
+		next.WatchProxies = candidates
+		_, err := run(ctx, next)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				fmt.Println("\nWatch mode stopped.")
+				return
+			}
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
 	}
 }
