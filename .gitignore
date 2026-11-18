@@ -6,3 +6,4 @@ results/
 my_proxies.txt
 *.local.txt
 .DS_Store
+/dist/
