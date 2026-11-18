@@ -24,3 +24,23 @@ jobs:
         run: go vet ./...
       - name: Build CLI
         run: go build .
+
+  packaging:
+    name: Validate cross-platform release assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check release build script syntax
+        run: bash -n scripts/build-release.sh
+      - name: Cross-compile all targets
+        run: bash scripts/build-release.sh
+      - name: Verify checksums and file count
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          test "$(find . -maxdepth 1 -type f -name 'us-proxy-auditor.*' | wc -l)" -eq 11
+          sha256sum -c SHA256SUMS.txt
