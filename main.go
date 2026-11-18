@@ -913,9 +913,7 @@ func main() {
 		timer := time.NewTimer(o.WatchInterval)
 		select {
 		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
+			timer.Stop()
 			fmt.Println("\nWatch mode stopped.")
 			return
 		case <-timer.C:
