@@ -1,0 +1,13 @@
+# Generated scan results
+results/
+
+# Python and uv
+__pycache__/
+*.py[cod]
+.venv/
+.python-version
+
+# Local inputs and editor state
+my_proxies.txt
+.vscode/
+.idea/
