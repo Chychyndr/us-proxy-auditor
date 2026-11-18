@@ -1,94 +1,111 @@
 # US Proxy Auditor
 
-A Windows-friendly command-line tool that collects public **HTTP and SOCKS5** proxies and independently checks whether their **exit IP addresses are in the United States**. It tests HTTPS connectivity, verifies TLS certificates, compares external IP checks, checks geolocation with two providers, and exports reproducible results for proxy clients such as Fury.
+A fast, terminal-only **Go** utility that collects public HTTP and SOCKS5 proxies, verifies their **US exit IPs**, and exports tested endpoints for clients such as Fury Browser. It requires **no Python, uv, third-party Go modules, graphical application, or account**.
 
-> **Security:** public proxies are untrusted. Never submit passwords, authentication tokens, payment details, or other sensitive data through an unknown proxy. Verification does not guarantee anonymity or acceptance by anti-bot systems.
+> **Security:** Public proxies are untrusted. Never send passwords, tokens, or sensitive personal information through unknown proxies. Passing these checks does not mean an IP is private or trusted by anti-bot systems.
 
-## Quick start (Windows 11)
+## Requirements
 
-1. Install [uv](https://docs.astral.sh/uv/getting-started/installation/).
-2. Download the repository and extract it to a local folder.
-3. Double-click **`start.bat`**. The first run may download Python and `httpx[socks]` automatically.
-4. Open **`results/verified_us.txt`** or **`results/verified_us.csv`** after the scan.
+- [Go 1.23 or later](https://go.dev/dl/) for running from source.
+- Windows 11, macOS, or Linux.
+- Network access to public source lists and the testing APIs.
 
-Alternatively, open PowerShell in the project directory:
+## Quick start (Windows / PowerShell)
 
-```powershell
-uv run .\us_proxy_auditor.py --limit 1500 --concurrency 45 --timeout 5 --rounds 3 --check-google --check-headers
-```
-
-The default launcher runs up to 45 simultaneous proxy checks with a 5-second timeout. Increasing concurrency can improve throughput, but API rate limits, network conditions, and slow endpoints may become bottlenecks. Shorter timeouts may reject otherwise functional proxies.
-
-## Commands
-
-**Thorough scan** (slower, with more retries and a larger geolocation budget):
+Download or clone this repository, open PowerShell inside it, and run:
 
 ```powershell
-uv run .\us_proxy_auditor.py --limit 5000 --concurrency 40 --timeout 8 --rounds 4 --geo-cap 500 --check-google --check-headers
+go run . --limit 1500 --concurrency 128 --timeout 5 --rounds 3 --check-google --check-headers
 ```
 
-**Exclude likely hosting/data-center networks** (heuristic classification):
+Or double-click **`start.bat`**, which runs the same console command. The `.bat` launcher is optional; there is no desktop interface. Go compiles the application automatically as part of `go run`.
+
+To build a portable executable once (optional):
 
 ```powershell
-uv run .\us_proxy_auditor.py --exclude-hosting --check-google --check-headers
+go build -o us-proxy-auditor.exe .
+.\us-proxy-auditor.exe --help
 ```
 
-**Use your own proxy list** (`my_proxies.txt` contains one address per line; e.g. `socks5://1.2.3.4:1080`):
+## Presets
+
+**Fast:**
 
 ```powershell
-uv run .\us_proxy_auditor.py --input .\my_proxies.txt --input-protocol socks5
+go run . --limit 2000 --concurrency 160 --timeout 4 --rounds 3 --geo-cap 200
 ```
 
-Use `uv run .\us_proxy_auditor.py --help` for all options. Accepted proxy formats are `IP:PORT`, `http://IP:PORT`, and `socks5://IP:PORT`. Proxies requiring authentication are not supported.
+**Thorough:**
 
-## Verification process
+```powershell
+go run . --limit 5000 --concurrency 96 --timeout 8 --rounds 4 --geo-cap 500 --check-google --check-headers --exclude-hosting
+```
 
-1. Download public proxy feeds and deduplicate endpoints; country labels supplied by feeds are treated as untrusted hints.
-2. Reject private, loopback, reserved, and non-global IPs. Attempt two HTTPS echo requests via each candidate with certificate validation enabled. Require both exit IP readings to match and differ from the direct IP when it is available.
-3. Query **ipwho.is** and **ipapi.co** for each unique exit IP (subject to `--geo-cap` and API limits). Require **both** to report `US`.
-4. Repeat HTTPS requests and require the exit IP to remain stable.
-5. Optionally check **Google generate_204** (`--check-google`) and proxy forwarding headers via **httpbin** (`--check-headers`). Any failed optional strict check disqualifies the candidate.
-6. Rank verified proxies by approximate network type, appearances in public lists, and latency. Organization-name keyword matching is only a hint; fewer list appearances do not imply lower real-world usage.
+**Custom list only:**
 
-The tool deliberately fails closed when geolocation is unavailable, when providers disagree, or when configured checks cannot be completed. It does not check WebRTC, browser fingerprints, or whether an individual website will flag a connection as automated.
+```powershell
+go run . --no-feeds --input .\my_proxies.txt --input-protocol socks5
+```
 
-## Output files
+Each local list entry may be `IP:PORT`, `http://IP:PORT`, or `socks5://IP:PORT`. Authenticated proxies and IPv6 endpoint literals are not supported.
 
-| File | Contents |
+## Key options
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--limit` | `1500` | Maximum candidate endpoints (up to 10,000) |
+| `--concurrency` | `128` | Concurrent proxy workers (up to 256) |
+| `--timeout` | `5` | Timeout in seconds for each network request |
+| `--rounds` | `3` | Minimum repeated HTTPS exit-IP checks (3–8) |
+| `--geo-cap` | `300` | Limit of distinct exit IPs queried against geolocation services |
+| `--geo-rate` | `2` | Maximum total geolocation requests per second (1–5) |
+| `--check-google` | Off | Require a `204` response from Google generate_204 |
+| `--check-headers` | Off | Reject exposed `Forwarded`, `Via`, and related headers |
+| `--exclude-hosting` | Off | Reject likely hosting networks using name-based hints |
+| `--input` | None | Read additional local proxy candidates |
+| `--no-feeds` | Off | Skip online lists and check only local input |
+| `--output` | `results` | Output directory |
+
+The **Windows launcher enables strict checks** by default. The raw command without additional flags skips the optional Google and forwarding-header tests.
+
+## Verification pipeline
+
+1. Download 13 public proxy feeds concurrently and remove duplicates.
+2. Reject malformed, local, private, and special-use IPv4 endpoints; attempt TCP connectivity.
+3. Require two distinct HTTPS IP-check services to return the same public exit IP, using normal TLS certificate validation.
+4. Query two independent geolocation services, **ipwho.is** and **ipapi.co**, over HTTPS and require both to confirm `US`. Requests are rate-limited and unique exit IPs are cached within the scan.
+5. Repeat HTTPS checks and require a stable exit IP.
+6. Optionally verify Google connectivity and forwarding headers; uncertain results fail closed when optional checks are enabled.
+7. Rank the verified results using approximate ISP/hosting classification, number of source-list appearances, and latency.
+
+Scanning is **network-bound**. A faster CPU or more concurrent workers cannot remove the latency of unresponsive proxies, bandwidth limitations, DNS delays, geolocation quotas, or remote rate limits. High worker counts can cause local resource exhaustion and trigger remote rate limiting. Prefer an incremental increase from 128 to 160 or 192, while checking actual results.
+
+The US geographic tag describes two providers' IP location reports. The provider's organization string is only a rough heuristic; fewer appearances in publicly indexed feeds do **not** prove low usage or better reputation.
+
+## Output
+
+| File | Description |
 | --- | --- |
-| `results/verified_us.txt` | Verified URLs in `socks5://IP:PORT` or `http://IP:PORT` format |
-| `results/verified_socks5.txt` | Verified SOCKS5 endpoints |
-| `results/verified_http.txt` | Verified HTTP endpoints |
-| `results/verified_us.csv` | Verified endpoints with latency, ISP/network hints, and sources |
-| `results/all_results.csv` | Every tested candidate, including failures and uncertainty |
-| `results/report.json` | Run metadata, result counts, errors, and input settings |
+| `results/verified_us.txt` | Confirmed proxy URLs (`socks5://IP:PORT` or `http://IP:PORT`) |
+| `results/verified_socks5.txt` | Confirmed SOCKS5 proxy URLs |
+| `results/verified_http.txt` | Confirmed HTTP proxy URLs |
+| `results/verified_us.csv` | Detailed metrics for passing proxies |
+| `results/all_results.csv` | Every candidate, including rejection reasons |
+| `results/report.json` | Metadata, durations, status counts, and source failures |
 
-**Using Fury:** choose the protocol in the profile's Proxy settings, enter the IP in **Host** and the port in **Port**. Do not paste the entire URL into the Host field.
+**Fury:** Enter the endpoint protocol, host, and port in the profile's Proxy settings. Avoid pasting the full proxy URL into the Host field.
 
-## Limitations and responsible use
+## Sources
 
-- Free proxies may be unsafe, unreliable, overloaded, or blocked. Only test public endpoints you are authorized to use, and respect provider terms.
-- `US` means two external geolocation providers agree; it does not prove physical location or residential status.
-- A `possibly_isp` classification is a rough organization-name heuristic, not proof that a proxy is private or residential.
-- IP geolocation services have usage quotas. The default `--geo-cap` is 300 unique exit IPs (maximum 500).
-- Some source URLs may return `404`, `429`, or other errors; these are reported and do not automatically invalidate remaining sources.
-- No proxy scan guarantees that Google or another anti-bot system will accept an IP.
-- Avoid excessive request rates. Concurrency is deliberately capped at 60.
+The built-in feeds are maintained independently by ProxyScrape, Litport, monosans, TheSpeedX, FusionProxies, proxmint, and proxio. Some lists may be removed, rate-limited, or unavailable; the scanner records these failures and continues. Source URLs and protocol hints are defined in [`main.go`](main.go).
 
-## Proxy list sources
-
-- [ProxyScrape](https://github.com/ProxyScrape/free-proxy-list)
-- [monosans](https://github.com/monosans/proxy-list)
-- [TheSpeedX](https://github.com/TheSpeedX/PROXY-List)
-- [FusionProxies](https://github.com/FusionProxies/free-proxy-list)
-- [proxmint](https://github.com/proxmint/free-proxy-list)
-- [proxio](https://github.com/proxio-io/proxy-list)
-- Additional sources are enumerated directly in `SOURCES` inside the Python script.
-
-## Tests
+## Test and build
 
 ```powershell
-uv run python -m unittest -v test_proxy_auditor.py
+go test ./...
+go vet ./...
+go test -race ./...  # if the Go race detector is supported on your system
+go build .
 ```
 
-The included offline tests cover proxy parsing, duplicate handling, geolocation decisions, result ranking hints, and output generation. They do not verify live proxy availability. Network behavior depends on the user's environment and current third-party service availability.
+The tests are offline and validate parsing, safe input filtering, deduplication, multi-stage decisions, classification, concurrency bounds, and report generation. Live proxy availability, ISP classification, anti-bot acceptance, and physical location cannot be guaranteed by unit tests. Only test public endpoints you are authorized to use; obey source-provider terms and API rate limits.

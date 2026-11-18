@@ -1,13 +1,16 @@
 @echo off
-chcp 65001 >nul
+setlocal
 cd /d "%~dp0"
-where uv >nul 2>nul
+where go >nul 2>nul
 if errorlevel 1 (
-  echo uv was not found. Install it from https://docs.astral.sh/uv/getting-started/installation/
+  echo Go was not found. Install Go from https://go.dev/dl/
+  echo Then reopen this terminal and try again.
   pause
   exit /b 1
 )
-uv run us_proxy_auditor.py --limit 1500 --concurrency 45 --timeout 5 --rounds 3 --check-google --check-headers %*
+go run . --limit 1500 --concurrency 128 --timeout 5 --rounds 3 --check-google --check-headers %*
+set "EXIT_CODE=%ERRORLEVEL%"
 echo.
-echo Results are saved in the results folder.
+echo Scan finished. Results are stored in the results folder.
 pause
+exit /b %EXIT_CODE%

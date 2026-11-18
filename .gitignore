@@ -1,13 +1,8 @@
-# Generated scan results
+# Generated results and local proxy inputs
 results/
-
-# Python and uv
-__pycache__/
-*.py[cod]
-.venv/
-.python-version
-
-# Local inputs and editor state
+*.exe
+*.log
+*.tmp
 my_proxies.txt
-.vscode/
-.idea/
+*.local.txt
+.DS_Store
